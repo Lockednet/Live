@@ -1,213 +1,193 @@
 #!/bin/bash
 
+clear
 echo "🔐 Verificando licença..."
 
-IP=$(curl -4 -s https://api.ipify.org | tr -d '[:space:]')
+SERVER_IP=$(curl -4 -s https://api.ipify.org)
 KEY_URL="https://raw.githubusercontent.com/Lockednet/Live/main/key.json"
 
-curl -s $KEY_URL -o /tmp/key.json
+AUTHORIZED=$(curl -s $KEY_URL | grep $SERVER_IP)
 
-if grep -q "\"$IP\"" /tmp/key.json; then
-  echo "✅ Licença válida para IP $IP"
-else
-  echo "❌ VPS NÃO AUTORIZADA! IP detectado: $IP"
+if [ -z "$AUTHORIZED" ]; then
+  echo "❌ VPS NÃO AUTORIZADA!"
   exit 1
 fi
 
-echo "✅ Licença válida para IP $IP"
+echo "✅ Licença válida para IP $SERVER_IP"
 
-echo "👤 Defina usuário do painel:"
-read PANEL_USER
+echo ""
+read -p "👤 Defina usuário do painel: " PANEL_USER
+read -s -p "🔑 Defina senha do painel: " PANEL_PASS
+echo ""
 
-echo "🔑 Defina senha do painel:"
-read PANEL_PASS
+apt update -y
+apt upgrade -y
+apt install -y nodejs npm ffmpeg sqlite3 curl
 
-HASH=$(echo -n $PANEL_PASS | sha256sum | awk '{print $1}')
-
-echo "🚀 Atualizando sistema..."
-apt update -y && apt upgrade -y
-apt install -y curl ffmpeg sqlite3 git
-
-echo "📦 Instalando Node..."
-curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
-apt install -y nodejs
-
-mkdir -p /root/live-system/videos
+mkdir -p /root/live-system
 cd /root/live-system
 
-npm init -y
-npm install express sqlite3 bcrypt express-session
+npm init -y >/dev/null 2>&1
+npm install express sqlite3 bcrypt express-session >/dev/null 2>&1
 
-cat > config.json << EOF
+cat > config.json <<EOF
 {
   "user": "$PANEL_USER",
-  "pass": "$HASH"
+  "pass": "$PANEL_PASS"
 }
 EOF
 
-cat > server.js << 'NODE'
-const express = require('express');
-const fs = require('fs');
-const sqlite3 = require('sqlite3').verbose();
-const session = require('express-session');
-const bcrypt = require('bcrypt');
-const { spawn } = require('child_process');
+cat > server.js <<'EOF'
+const express = require("express");
+const sqlite3 = require("sqlite3").verbose();
+const session = require("express-session");
+const bcrypt = require("bcrypt");
+const { spawn } = require("child_process");
+const fs = require("fs");
 
 const app = express();
-app.use(express.urlencoded({extended:true}));
-app.use(express.json());
+const db = new sqlite3.Database("./database.db");
 
+app.use(express.urlencoded({ extended: true }));
 app.use(session({
-  secret: 'live_secret',
-  resave:false,
-  saveUninitialized:true
+    secret: "live_secret",
+    resave: false,
+    saveUninitialized: true
 }));
 
-const db = new sqlite3.Database('./database.db');
-db.run(`CREATE TABLE IF NOT EXISTS streams(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT,
-  url TEXT,
-  streamKey TEXT,
-  file TEXT,
-  status TEXT
-)`);
+const config = JSON.parse(fs.readFileSync("config.json"));
 
-let processes = {};
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS streams (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT,
+        platform TEXT,
+        url TEXT,
+        streamKey TEXT,
+        file TEXT,
+        status TEXT,
+        startedAt INTEGER
+    )`);
+});
+
+const platforms = {
+    twitch: "rtmp://live.twitch.tv/app",
+    kick: "rtmps://live.kick.com/app",
+    youtube: "rtmp://a.rtmp.youtube.com/live2",
+    facebook: "rtmps://live-api-s.facebook.com:443/rtmp/"
+};
 
 function auth(req,res,next){
-  if(req.session.logged) next();
-  else res.redirect('/login');
+    if(req.session.logged) next();
+    else res.redirect("/login");
 }
 
-function formatTime(ms){
-  let s=Math.floor(ms/1000);
-  let h=Math.floor(s/3600);
-  let m=Math.floor((s%3600)/60);
-  let ss=s%60;
-  return h+"h "+m+"m "+ss+"s";
-}
-
-app.get('/login',(req,res)=>{
-  res.send(`
-  <style>
-  body{background:#140021;color:white;font-family:sans-serif;text-align:center}
-  input{padding:10px;margin:10px;border-radius:8px;border:none}
-  button{padding:10px 20px;background:#7b2ff7;color:white;border:none;border-radius:8px}
-  </style>
-  <h2>Login</h2>
-  <form method="POST">
-  <input name="user" placeholder="Usuário"/><br>
-  <input name="pass" type="password" placeholder="Senha"/><br>
-  <button>Entrar</button>
-  </form>
-  `);
+app.get("/login",(req,res)=>{
+    res.send(`
+    <body style="background:#1e1b2e;color:white;font-family:sans-serif;text-align:center;padding:100px">
+    <h2>Live Panel</h2>
+    <form method="POST">
+    <input name="user" placeholder="Usuário"/><br><br>
+    <input name="pass" type="password" placeholder="Senha"/><br><br>
+    <button>Entrar</button>
+    </form>
+    </body>`);
 });
 
-app.post('/login',(req,res)=>{
-  const config=JSON.parse(fs.readFileSync('./config.json'));
-  const hash=require('crypto').createHash('sha256').update(req.body.pass).digest('hex');
-  if(req.body.user===config.user && hash===config.pass){
-    req.session.logged=true;
-    res.redirect('/');
-  } else res.send("Login inválido");
+app.post("/login",(req,res)=>{
+    if(req.body.user===config.user && req.body.pass===config.pass){
+        req.session.logged=true;
+        res.redirect("/");
+    } else res.send("Login inválido");
 });
 
-app.get('/',auth,(req,res)=>{
-  db.all("SELECT * FROM streams",(err,rows)=>{
-    let html=`
-    <meta http-equiv="refresh" content="5">
-    <style>
-    body{background:#140021;color:white;font-family:sans-serif}
-    .card{background:#1f0033;padding:15px;margin:10px;border-radius:12px}
-    button{background:#7b2ff7;color:white;border:none;padding:6px 12px;border-radius:6px}
-    </style>
-    <h1>🎥 Live Dashboard</h1>
-    <a href="/add"><button>+ Nova Live</button></a>
-    `;
+app.get("/",auth,(req,res)=>{
+    db.all("SELECT * FROM streams",(err,rows)=>{
+        let html=`<body style="background:#1e1b2e;color:white;font-family:sans-serif;padding:30px">
+        <h1 style="color:#a855f7">🔥 Live Streaming Panel</h1>
+        <a href="/add">➕ Adicionar Live</a><hr>`;
 
-    rows.forEach(r=>{
-      let tempo="0s";
-      if(processes[r.id]){
-        tempo=formatTime(Date.now()-processes[r.id].start);
-      }
-      html+=`
-      <div class="card">
-      <h3>${r.name}</h3>
-      Status: ${r.status}<br>
-      Tempo: ${tempo}<br>
-      Arquivo: ${r.file}<br>
-      <a href="/start/${r.id}"><button>Start</button></a>
-      <a href="/stop/${r.id}"><button>Stop</button></a>
-      </div>
-      `;
+        rows.forEach(s=>{
+            let time = s.startedAt ? Math.floor((Date.now()-s.startedAt)/1000) : 0;
+            html+=`
+            <div style="background:#2e293d;padding:15px;margin:10px;border-radius:10px">
+            <h3>${s.name} (${s.platform})</h3>
+            Status: ${s.status}<br>
+            Tempo: ${time}s<br>
+            <a href="/start/${s.id}">Start</a> |
+            <a href="/stop/${s.id}">Stop</a>
+            </div>`;
+        });
+
+        res.send(html+"</body>");
     });
-
-    res.send(html);
-  });
 });
 
-app.get('/add',auth,(req,res)=>{
-  res.send(`
-  <form method="POST">
-  Nome:<br><input name="name"/><br>
-  URL:<br><input name="url"/><br>
-  StreamKey:<br><input name="streamKey"/><br>
-  Arquivo:<br><input name="file"/><br><br>
-  <button>Salvar</button>
-  </form>
-  `);
+app.get("/add",auth,(req,res)=>{
+    res.send(`
+    <body style="background:#1e1b2e;color:white;font-family:sans-serif;padding:30px">
+    <h2>Nova Live</h2>
+    <form method="POST">
+    Nome:<br><input name="name"><br>
+    Plataforma:<br>
+    <select name="platform">
+      <option value="twitch">Twitch</option>
+      <option value="kick">Kick</option>
+      <option value="youtube">YouTube</option>
+      <option value="facebook">Facebook</option>
+    </select><br>
+    Stream Key:<br><input name="key"><br>
+    Arquivo MP4:<br><input name="file"><br><br>
+    <button>Salvar</button>
+    </form>
+    </body>`);
 });
 
-app.post('/add',auth,(req,res)=>{
-  db.run("INSERT INTO streams(name,url,streamKey,file,status) VALUES(?,?,?,?,?)",
-  [req.body.name,req.body.url,req.body.streamKey,req.body.file,"stopped"]);
-  res.redirect('/');
+app.post("/add",auth,(req,res)=>{
+    const url = platforms[req.body.platform];
+    db.run("INSERT INTO streams (name,platform,url,streamKey,file,status) VALUES (?,?,?,?,?,?)",
+    [req.body.name,req.body.platform,url,req.body.key,req.body.file,"stopped"]);
+    res.redirect("/");
 });
 
-app.get('/start/:id',auth,(req,res)=>{
-  db.get("SELECT * FROM streams WHERE id=?",[req.params.id],(err,row)=>{
-    if(processes[row.id]) return res.redirect('/');
-    const args=[
-      "-re","-stream_loop","-1",
-      "-i","./videos/"+row.file,
-      "-vf","scale=1280:720",
-      "-c:v","libx264","-preset","veryfast",
-      "-f","flv",
-      row.url+row.streamKey
-    ];
-    const ff=spawn("ffmpeg",args);
-    processes[row.id]={proc:ff,start:Date.now()};
-    db.run("UPDATE streams SET status='running' WHERE id=?",[row.id]);
-    ff.stderr.on('data',d=>console.log(d.toString()));
-    ff.on('close',()=>{
-      delete processes[row.id];
-      db.run("UPDATE streams SET status='stopped' WHERE id=?",[row.id]);
+app.get("/start/:id",auth,(req,res)=>{
+    db.get("SELECT * FROM streams WHERE id=?",[req.params.id],(err,s)=>{
+        const ff = spawn("ffmpeg",[
+            "-re","-stream_loop","-1",
+            "-i",`./videos/${s.file}`,
+            "-c","copy","-f","flv",
+            `${s.url}/${s.streamKey}`
+        ]);
+
+        ff.stderr.on("data",data=>{
+            console.log(data.toString());
+        });
+
+        db.run("UPDATE streams SET status='running', startedAt=? WHERE id=?",
+        [Date.now(),req.params.id]);
+
+        res.redirect("/");
     });
-    res.redirect('/');
-  });
 });
 
-app.get('/stop/:id',auth,(req,res)=>{
-  if(processes[req.params.id]){
-    processes[req.params.id].proc.kill('SIGKILL');
-    delete processes[req.params.id];
-    db.run("UPDATE streams SET status='stopped' WHERE id=?",[req.params.id]);
-  }
-  res.redirect('/');
+app.get("/stop/:id",auth,(req,res)=>{
+    db.run("UPDATE streams SET status='stopped', startedAt=NULL WHERE id=?",
+    [req.params.id]);
+    res.redirect("/");
 });
 
-app.listen(3000,()=>console.log("Painel PRO rodando"));
-NODE
+app.listen(3000,()=>console.log("Servidor rodando"));
+EOF
 
-cat > /etc/systemd/system/livesystem.service << EOF
+mkdir -p videos
+
+cat > /etc/systemd/system/livesystem.service <<EOF
 [Unit]
-Description=Live PRO System
+Description=Live Streaming System
 After=network.target
 
 [Service]
 ExecStart=/usr/bin/node /root/live-system/server.js
-WorkingDirectory=/root/live-system
 Restart=always
 User=root
 
@@ -219,7 +199,6 @@ systemctl daemon-reload
 systemctl enable livesystem
 systemctl start livesystem
 
-echo "=================================="
-echo "✅ INSTALADO COM SUCESSO"
-echo "🌐 http://$IP:3000"
-echo "=================================="
+echo ""
+echo "✅ INSTALAÇÃO FINALIZADA"
+echo "🌐 Acesse: http://$SERVER_IP:3000"
