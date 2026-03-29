@@ -2,13 +2,15 @@
 
 echo "🔐 Verificando licença..."
 
-IP=$(curl -s ifconfig.me)
+IP=$(curl -4 -s https://api.ipify.org | tr -d '[:space:]')
 KEY_URL="https://raw.githubusercontent.com/Lockednet/Live/main/key.json"
 
 curl -s $KEY_URL -o /tmp/key.json
 
-if ! grep -q "$IP" /tmp/key.json; then
-  echo "❌ VPS NÃO AUTORIZADA!"
+if grep -q "\"$IP\"" /tmp/key.json; then
+  echo "✅ Licença válida para IP $IP"
+else
+  echo "❌ VPS NÃO AUTORIZADA! IP detectado: $IP"
   exit 1
 fi
 
